@@ -1,0 +1,239 @@
+import os
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import LabelEncoder
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    precision_recall_curve,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score
+)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ------------------------------------------------------------
+# Configuration (repository-friendly, relative paths)
+# ------------------------------------------------------------
+SEED = 42
+DATA_PATH = "data/cirs_cleaned.xlsx"      # replace with your file; repo does not ship data
+TEXT_COL = "text"
+LABEL_COL = "label"
+OUT_DIR = "results/tfidf_baseline_out"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+np.random.seed(SEED)
+
+# ------------------------------------------------------------
+# Robust loading of German stopwords (optional)
+# ------------------------------------------------------------
+def get_german_stopwords():
+    try:
+        import nltk
+        from nltk.corpus import stopwords
+        try:
+            _ = stopwords.words("german")
+        except LookupError:
+            import nltk
+            nltk.download("stopwords")
+        return stopwords.words("german")
+    except Exception:
+        return None
+
+german_stopwords = get_german_stopwords()
+
+# ------------------------------------------------------------
+# Load and prepare data
+# ------------------------------------------------------------
+df = pd.read_excel(DATA_PATH)
+df = df[[TEXT_COL, LABEL_COL]].dropna().drop_duplicates()
+df = df.rename(columns={TEXT_COL: "text", LABEL_COL: "label"})
+
+le = LabelEncoder()
+df["y"] = le.fit_transform(df["label"])
+classes = le.classes_
+n_classes = len(classes)
+
+X = df["text"].tolist()
+y = df["y"].to_numpy()
+
+# ------------------------------------------------------------
+# Pipeline and hyperparameter grid
+# ------------------------------------------------------------
+pipe = Pipeline([
+    ("tfidf", TfidfVectorizer(
+        strip_accents="unicode",
+        lowercase=True,
+        sublinear_tf=True
+    )),
+    ("clf", LogisticRegression(
+        max_iter=5000,
+        class_weight="balanced",
+        solver="liblinear",
+        random_state=SEED
+    ))
+])
+
+param_grid = {
+    "tfidf__stop_words": [None, german_stopwords],
+    "tfidf__ngram_range": [(1,1), (1,2)],
+    "tfidf__max_features": [5000, 10000, 30000],
+    "tfidf__min_df": [1, 2],
+    "clf__C": [0.1, 1.0, 3.0]
+}
+
+# ------------------------------------------------------------
+# Cross-validation strategy for grid search
+# ------------------------------------------------------------
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+
+# ------------------------------------------------------------
+# Grid search (optimize macro-F1)
+# ------------------------------------------------------------
+gs = GridSearchCV(
+    pipe,
+    param_grid=param_grid,
+    cv=cv,
+    scoring="f1_macro",
+    n_jobs=-1,
+    refit=True,
+    verbose=0
+)
+gs.fit(X, y)
+best_model = gs.best_estimator_
+
+# ------------------------------------------------------------
+# Per-fold evaluation using the best configuration
+# ------------------------------------------------------------
+all_y_true, all_y_pred, all_y_prob = [], [], []
+
+def plot_cm(cm, title, path):
+    plt.figure(figsize=(6,6))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(title)
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(path, dpi=200)
+    plt.close()
+
+splitter = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+splits = list(splitter.split(X, y))
+
+for fold_idx, (tr, te) in enumerate(splits, 1):
+    fold_dir = os.path.join(OUT_DIR, f"fold_{fold_idx}")
+    os.makedirs(fold_dir, exist_ok=True)
+
+    X_train = [X[i] for i in tr]
+    X_test  = [X[i] for i in te]
+    y_train = y[tr]
+    y_test  = y[te]
+
+    best_model.fit(X_train, y_train)
+    y_prob = best_model.predict_proba(X_test)
+    y_hat  = np.argmax(y_prob, axis=1)
+
+    all_y_true.extend(y_test)
+    all_y_pred.extend(y_hat)
+    all_y_prob.append(y_prob)
+
+    rep_str = classification_report(y_test, y_hat, target_names=list(classes), digits=3, zero_division=0)
+    with open(os.path.join(fold_dir, "report.txt"), "w", encoding="utf-8") as f:
+        f.write(rep_str)
+
+    acc_fold = (y_hat == y_test).mean()
+    prec_fold = precision_score(y_test, y_hat, average="macro", zero_division=0)
+    rec_fold  = recall_score(y_test, y_hat, average="macro", zero_division=0)
+    f1_fold   = f1_score(y_test, y_hat, average="macro", zero_division=0)
+
+    ap_macro_fold = average_precision_score(y_test, y_prob, average="macro")
+    ap_weighted_fold = average_precision_score(y_test, y_prob, average="weighted")
+
+    with open(os.path.join(fold_dir, "metrics.txt"), "w", encoding="utf-8") as f:
+        f.write(f"accuracy={acc_fold:.3f}\n")
+        f.write(f"macro_precision={prec_fold:.3f}\n")
+        f.write(f"macro_recall={rec_fold:.3f}\n")
+        f.write(f"macro_f1={f1_fold:.3f}\n")
+        f.write(f"macro_AUPRC={ap_macro_fold:.3f}\n")
+        f.write(f"weighted_AUPRC={ap_weighted_fold:.3f}\n")
+
+    cm = confusion_matrix(y_test, y_hat, labels=np.arange(n_classes))
+    plot_cm(cm, f"Confusion Matrix Fold {fold_idx}", os.path.join(fold_dir, f"cm_fold{fold_idx}.png"))
+
+    for c_idx, cname in enumerate(classes):
+        y_bin = (y_test == c_idx).astype(int)
+        prec, rec, _ = precision_recall_curve(y_bin, y_prob[:, c_idx])
+        ap = average_precision_score(y_bin, y_prob[:, c_idx])
+        plt.figure()
+        plt.step(rec, prec, where="post")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"PR Curve Fold {fold_idx} – {cname}  AP={ap:.3f}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(fold_dir, f"pr_fold{fold_idx}_{c_idx}_{cname}.png"), dpi=200)
+        plt.close()
+
+# ------------------------------------------------------------
+# Aggregate overall results
+# ------------------------------------------------------------
+all_y_true = np.array(all_y_true)
+all_y_pred = np.array(all_y_pred)
+all_y_prob = np.concatenate(all_y_prob, axis=0)
+
+overall_report = classification_report(
+    all_y_true, all_y_pred,
+    target_names=list(classes),
+    digits=3,
+    zero_division=0
+)
+with open(os.path.join(OUT_DIR, "report_overall.txt"), "w", encoding="utf-8") as f:
+    f.write(overall_report)
+
+macro_f1 = f1_score(all_y_true, all_y_pred, average="macro", zero_division=0)
+ap_macro = average_precision_score(all_y_true, all_y_prob, average="macro")
+ap_weighted = average_precision_score(all_y_true, all_y_prob, average="weighted")
+
+with open(os.path.join(OUT_DIR, "metrics_overall.txt"), "w") as f:
+    f.write(f"macro_F1={macro_f1:.3f}\n")
+    f.write(f"macro_AUPRC={ap_macro:.3f}\n")
+    f.write(f"weighted_AUPRC={ap_weighted:.3f}\n")
+
+for c_idx, cname in enumerate(classes):
+    y_bin_all = (all_y_true == c_idx).astype(int)
+    prec, rec, _ = precision_recall_curve(y_bin_all, all_y_prob[:, c_idx])
+    ap = average_precision_score(y_bin_all, all_y_prob[:, c_idx])
+    plt.figure()
+    plt.step(rec, prec, where="post")
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title(f"PR Curve Overall – {cname}  AP={ap:.3f}")
+    plt.tight_layout()
+    plt.savefig(os.path.join(OUT_DIR, f"pr_overall_{c_idx}_{cname}.png"), dpi=200)
+    plt.close()
+
+# Refit on full data to extract top features per class
+best_model.fit(X, y)
+vec = best_model.named_steps["tfidf"]
+clf = best_model.named_steps["clf"]
+feature_names = vec.get_feature_names_out()
+
+with open(os.path.join(OUT_DIR, "top_words.txt"), "w", encoding="utf-8") as f:
+    for i, class_index in enumerate(clf.classes_):
+        top_idx = clf.coef_[i].argsort()[-20:][::-1]
+        words = [feature_names[j] for j in top_idx]
+        f.write(f"{classes[class_index]}: {', '.join(words)}\n")
+
+# Minimal console summary
+print("Finished TF-IDF baseline evaluation.")
+print(f"Overall Macro-F1: {macro_f1:.3f}")
+print(f"Overall Macro-AUPRC: {ap_macro:.3f}")
+print(f"Overall Weighted-AUPRC: {ap_weighted:.3f}")
