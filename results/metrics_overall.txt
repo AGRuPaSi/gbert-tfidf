@@ -1,0 +1,3 @@
+macro_F1=0.441
+macro_AUPRC=0.459
+weighted_AUPRC=0.788
