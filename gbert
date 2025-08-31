@@ -16,8 +16,6 @@ from sklearn.metrics import (
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import shap
-import pickle
 
 from transformers import (
     AutoTokenizer,
@@ -44,9 +42,9 @@ def set_seed(seed=42):
 set_seed(42)
 
 # ------------------------------------------------------------------
-# Paths and data settings (replace with your own data path)
+# Paths and data settings
 # ------------------------------------------------------------------
-DATA_PATH = "data/cirs_cleaned.xlsx"     # anonymized placeholder
+DATA_PATH = "data/cirs_cleaned.xlsx"   # anonymized placeholder
 TEXT_COL = "text"
 LABEL_COL = "label"
 OUT_ROOT = "results/risk_category_gbert"
@@ -61,7 +59,7 @@ def append_log(path, text):
 master_log = os.path.join(OUT_ROOT, "master_log.txt")
 
 # ------------------------------------------------------------------
-# Load and prepare data
+# Load and encode data
 # ------------------------------------------------------------------
 df = pd.read_excel(DATA_PATH)
 df = df[[TEXT_COL, LABEL_COL]].dropna().drop_duplicates()
@@ -73,7 +71,7 @@ num_labels = len(classes)
 np.save(os.path.join(OUT_ROOT, "label_classes.npy"), classes)
 
 # ------------------------------------------------------------------
-# Tokenizer and dataset preparation
+# Tokenizer and dataset prep
 # ------------------------------------------------------------------
 tokenizer = AutoTokenizer.from_pretrained("deepset/gbert-base", use_fast=True)
 
@@ -87,7 +85,7 @@ def to_hf_dataset(pdf):
     return ds
 
 # ------------------------------------------------------------------
-# Custom Trainer with class weighting
+# Custom Trainer with class weighting and label smoothing
 # ------------------------------------------------------------------
 class WeightedTrainer(Trainer):
     def __init__(self, class_weights=None, **kwargs):
@@ -99,6 +97,7 @@ class WeightedTrainer(Trainer):
         outputs = model(**inputs)
         logits = outputs.get("logits")
 
+        # Label smoothing
         ls = getattr(self.args, "label_smoothing_factor", 0.0)
         if ls and ls > 0:
             with torch.no_grad():
@@ -110,6 +109,7 @@ class WeightedTrainer(Trainer):
             ce = nn.CrossEntropyLoss(reduction="none")
             loss_unreduced = ce(logits, labels)
 
+        # Apply per-class weights
         if self.class_weights is not None:
             cw = torch.tensor(self.class_weights, dtype=torch.float32, device=logits.device)
             sample_w = cw[labels]
@@ -140,12 +140,13 @@ def compute_fold_metrics(y_true, y_pred, y_prob, fold_dir, prefix="fold"):
         "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
     }
 
+    # AUPRC
     Yb = label_binarize(y_true, classes=np.arange(num_labels))
     metrics["auprc_macro"] = average_precision_score(Yb, y_prob, average="macro")
     metrics["auprc_weighted"] = average_precision_score(Yb, y_prob, average="weighted")
 
-    # PR curves
     os.makedirs(fold_dir, exist_ok=True)
+    # PR curves
     for idx, cname in enumerate(classes):
         y_bin = (y_true == idx).astype(int)
         prec, rec, _ = precision_recall_curve(y_bin, y_prob[:, idx])
