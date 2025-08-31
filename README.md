@@ -34,6 +34,6 @@ This project investigates whether transformer-based language models can classify
 
 ## Results
 - **GBERT:** macro-F1 = 0.44, weighted-F1 = 0.75.  
-- **TF-IDF baseline:** much lower performance on minority classes.  
+- **TF-IDF baseline:** macro-F1 = 0.35, weighted - F1 = 0.71
 - **SHAP analysis:** Highlighted clinically meaningful token contributions  
   
