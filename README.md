@@ -14,7 +14,7 @@ This project investigates whether transformer-based language models can classify
 - Dataset: 617 anonymized CIRS reports collected at a German university hospital (2018–2024).  
 - Labels: Organization, Treatment, Documentation, and Consent/Communication.  
 - Annotation: Reports were categorized by the hospital’s risk management team. Interrater agreement: κ = 0.75.  
-- **Note:** Due to confidentiality, the dataset cannot be shared. A placeholder directory is included instead.
+- **Note:** Due to confidentiality, the dataset cannot be shared. 
 
 ---
 
@@ -35,9 +35,5 @@ This project investigates whether transformer-based language models can classify
 ## Results
 - **GBERT:** macro-F1 = 0.44, weighted-F1 = 0.75.  
 - **TF-IDF baseline:** much lower performance on minority classes.  
-- **SHAP analysis:** Highlighted clinically meaningful token contributions (e.g., medication names, documentation markers).  
-- Figures include PR curves, confusion matrices, and SHAP explanations.
-
----
-
-## Repository Structure
+- **SHAP analysis:** Highlighted clinically meaningful token contributions  
+  
