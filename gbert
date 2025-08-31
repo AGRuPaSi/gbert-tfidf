@@ -1,0 +1,310 @@
+import os
+import random
+import numpy as np
+import pandas as pd
+import torch
+from torch import nn
+from datasets import Dataset
+from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import LabelEncoder, label_binarize
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    confusion_matrix, classification_report,
+    precision_recall_curve, average_precision_score
+)
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import shap
+import pickle
+
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    EarlyStoppingCallback
+)
+import transformers
+
+# Reduce HuggingFace logging
+transformers.logging.set_verbosity_error()
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+
+# Reproducibility
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+# ------------------------------------------------------------------
+# Paths and data settings (replace with your own data path)
+# ------------------------------------------------------------------
+DATA_PATH = "data/cirs_cleaned.xlsx"     # anonymized placeholder
+TEXT_COL = "text"
+LABEL_COL = "label"
+OUT_ROOT = "results/risk_category_gbert"
+os.makedirs(OUT_ROOT, exist_ok=True)
+
+# Logging helper
+def append_log(path, text):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(text + ("\n" if not text.endswith("\n") else ""))
+
+master_log = os.path.join(OUT_ROOT, "master_log.txt")
+
+# ------------------------------------------------------------------
+# Load and prepare data
+# ------------------------------------------------------------------
+df = pd.read_excel(DATA_PATH)
+df = df[[TEXT_COL, LABEL_COL]].dropna().drop_duplicates()
+
+label_encoder = LabelEncoder()
+df["y"] = label_encoder.fit_transform(df[LABEL_COL])
+classes = label_encoder.classes_
+num_labels = len(classes)
+np.save(os.path.join(OUT_ROOT, "label_classes.npy"), classes)
+
+# ------------------------------------------------------------------
+# Tokenizer and dataset preparation
+# ------------------------------------------------------------------
+tokenizer = AutoTokenizer.from_pretrained("deepset/gbert-base", use_fast=True)
+
+def tokenize(example):
+    return tokenizer(example["text"], padding=True, truncation=True, max_length=512)
+
+def to_hf_dataset(pdf):
+    ds = Dataset.from_pandas(pdf[["text","y"]].rename(columns={"y":"label"}))
+    ds = ds.map(tokenize, batched=True)
+    ds.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
+    return ds
+
+# ------------------------------------------------------------------
+# Custom Trainer with class weighting
+# ------------------------------------------------------------------
+class WeightedTrainer(Trainer):
+    def __init__(self, class_weights=None, **kwargs):
+        super().__init__(**kwargs)
+        self.class_weights = class_weights
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.get("labels")
+        outputs = model(**inputs)
+        logits = outputs.get("logits")
+
+        ls = getattr(self.args, "label_smoothing_factor", 0.0)
+        if ls and ls > 0:
+            with torch.no_grad():
+                true_dist = torch.zeros_like(logits)
+                true_dist.fill_(ls / (logits.size(-1) - 1))
+                true_dist.scatter_(1, labels.unsqueeze(1), 1 - ls)
+            loss_unreduced = -torch.sum(true_dist * torch.log_softmax(logits, dim=-1), dim=-1)
+        else:
+            ce = nn.CrossEntropyLoss(reduction="none")
+            loss_unreduced = ce(logits, labels)
+
+        if self.class_weights is not None:
+            cw = torch.tensor(self.class_weights, dtype=torch.float32, device=logits.device)
+            sample_w = cw[labels]
+            loss = (loss_unreduced * sample_w).mean()
+        else:
+            loss = loss_unreduced.mean()
+
+        return (loss, outputs) if return_outputs else loss
+
+# ------------------------------------------------------------------
+# Cross-validation setup
+# ------------------------------------------------------------------
+skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+X = df["text"].tolist()
+y = df["y"].to_numpy()
+
+# ------------------------------------------------------------------
+# Evaluation helper
+# ------------------------------------------------------------------
+def compute_fold_metrics(y_true, y_pred, y_prob, fold_dir, prefix="fold"):
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "precision_weighted": precision_score(y_true, y_pred, average="weighted", zero_division=0),
+        "recall_weighted": recall_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1_weighted": f1_score(y_true, y_pred, average="weighted", zero_division=0),
+        "f1_macro": f1_score(y_true, y_pred, average="macro", zero_division=0),
+    }
+
+    Yb = label_binarize(y_true, classes=np.arange(num_labels))
+    metrics["auprc_macro"] = average_precision_score(Yb, y_prob, average="macro")
+    metrics["auprc_weighted"] = average_precision_score(Yb, y_prob, average="weighted")
+
+    # PR curves
+    os.makedirs(fold_dir, exist_ok=True)
+    for idx, cname in enumerate(classes):
+        y_bin = (y_true == idx).astype(int)
+        prec, rec, _ = precision_recall_curve(y_bin, y_prob[:, idx])
+        ap = average_precision_score(y_bin, y_prob[:, idx])
+        plt.figure()
+        plt.step(rec, prec, where="post")
+        plt.xlabel("Recall")
+        plt.ylabel("Precision")
+        plt.title(f"PR Curve {prefix} – {cname}  AP={ap:.3f}")
+        plt.tight_layout()
+        plt.savefig(os.path.join(fold_dir, f"pr_{prefix}_{idx}_{cname}.png"), dpi=200)
+        plt.close()
+
+    # Confusion matrix
+    cm = confusion_matrix(y_true, y_pred, labels=np.arange(num_labels))
+    plt.figure(figsize=(6,6))
+    plt.imshow(cm, cmap="Blues")
+    plt.title(f"Confusion Matrix {prefix}")
+    plt.xlabel("Predicted")
+    plt.ylabel("True")
+    plt.colorbar()
+    plt.tight_layout()
+    plt.savefig(os.path.join(fold_dir, f"cm_{prefix}.png"), dpi=200)
+    plt.close()
+
+    # Classification report
+    rep = classification_report(y_true, y_pred, target_names=list(classes), digits=3, zero_division=0)
+    with open(os.path.join(fold_dir, f"report_{prefix}.txt"), "w", encoding="utf-8") as f:
+        f.write(rep)
+
+    return metrics, rep
+
+# ------------------------------------------------------------------
+# Training with small hyperparameter grid
+# ------------------------------------------------------------------
+LR_GRID = [2e-5, 5e-5]
+EPOCH_GRID = [3, 5]
+
+all_true, all_pred, all_prob = [], [], []
+fold_table = []
+
+for fold, (tr, te) in enumerate(skf.split(X, y), 1):
+    fold_root = os.path.join(OUT_ROOT, f"fold_{fold}")
+    os.makedirs(fold_root, exist_ok=True)
+    fold_log = os.path.join(fold_root, "fold_log.txt")
+
+    train_df = df.iloc[tr].reset_index(drop=True)
+    test_df  = df.iloc[te].reset_index(drop=True)
+
+    # Compute class weights per fold
+    class_counts = np.bincount(train_df["y"].to_numpy(), minlength=num_labels)
+    class_weights = (len(train_df) / (num_labels * np.maximum(class_counts, 1))).astype(np.float32)
+
+    train_ds = to_hf_dataset(train_df)
+    test_ds  = to_hf_dataset(test_df)
+
+    best_macro_f1 = -1.0
+    best_pred = best_prob = best_model = None
+    best_args = (None, None)
+
+    for lr in LR_GRID:
+        for n_ep in EPOCH_GRID:
+            output_dir = os.path.join(fold_root, f"lr{lr}_ep{n_ep}")
+            log_dir = os.path.join(output_dir, "logs")
+            os.makedirs(output_dir, exist_ok=True)
+
+            training_args = TrainingArguments(
+                output_dir=output_dir,
+                evaluation_strategy="epoch",
+                save_strategy="epoch",
+                load_best_model_at_end=True,
+                per_device_train_batch_size=8,
+                per_device_eval_batch_size=8,
+                num_train_epochs=n_ep,
+                learning_rate=lr,
+                logging_dir=log_dir,
+                report_to="none",
+                label_smoothing_factor=0.1,
+                seed=42,
+                disable_tqdm=True,
+                logging_strategy="epoch"
+            )
+
+            model = AutoModelForSequenceClassification.from_pretrained(
+                "deepset/gbert-base", num_labels=num_labels
+            ).to(device)
+
+            trainer = WeightedTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_ds,
+                eval_dataset=test_ds,
+                class_weights=class_weights,
+                callbacks=[EarlyStoppingCallback(early_stopping_patience=1)],
+            )
+
+            trainer.train()
+            logits = trainer.predict(test_ds).predictions
+            probs = torch.softmax(torch.tensor(logits), dim=1).numpy()
+            preds = np.argmax(probs, axis=1)
+            y_true = test_df["y"].to_numpy()
+            macro_f1 = f1_score(y_true, preds, average="macro", zero_division=0)
+
+            append_log(fold_log, f"HP trial: lr={lr}, epochs={n_ep}, macro_F1={macro_f1:.4f}")
+
+            if macro_f1 > best_macro_f1:
+                best_macro_f1 = macro_f1
+                best_pred = preds
+                best_prob = probs
+                best_model = trainer.model
+                best_args = (lr, n_ep)
+
+    # Skip if no valid model
+    if best_pred is None or best_prob is None:
+        continue
+
+    y_true = test_df["y"].to_numpy()
+    metrics, rep = compute_fold_metrics(y_true, best_pred, best_prob, fold_root, prefix=f"fold{fold}")
+
+    all_true.append(y_true.astype(int))
+    all_pred.append(best_pred.astype(int))
+    all_prob.append(best_prob.astype(np.float32))
+
+    fold_table.append({
+        "fold": fold,
+        "lr": best_args[0],
+        "epochs": best_args[1],
+        "accuracy": metrics["accuracy"],
+        "f1_macro": metrics["f1_macro"],
+        "auprc_macro": metrics["auprc_macro"],
+        "auprc_weighted": metrics["auprc_weighted"]
+    })
+
+# ------------------------------------------------------------------
+# Aggregate overall results
+# ------------------------------------------------------------------
+overall_dir = os.path.join(OUT_ROOT, "overall")
+os.makedirs(overall_dir, exist_ok=True)
+
+if len(all_true) == 0:
+    raise SystemExit("No folds produced predictions.")
+
+all_true = np.concatenate(all_true, axis=0)
+all_pred = np.concatenate(all_pred, axis=0)
+all_prob = np.concatenate(all_prob, axis=0)
+
+overall_rep = classification_report(all_true, all_pred, target_names=list(classes), digits=3, zero_division=0)
+with open(os.path.join(overall_dir, "report_overall.txt"), "w", encoding="utf-8") as f:
+    f.write(overall_rep)
+
+macro_f1_overall = f1_score(all_true, all_pred, average="macro", zero_division=0)
+Yb_overall = label_binarize(all_true, classes=np.arange(num_labels))
+ap_macro_overall = average_precision_score(Yb_overall, all_prob, average="macro")
+ap_weighted_overall = average_precision_score(Yb_overall, all_prob, average="weighted")
+
+with open(os.path.join(overall_dir, "metrics_overall.txt"), "w") as f:
+    f.write(f"macro_F1={macro_f1_overall:.3f}\n")
+    f.write(f"macro_AUPRC={ap_macro_overall:.3f}\n")
+    f.write(f"weighted_AUPRC={ap_weighted_overall:.3f}\n")
+
+pd.DataFrame(fold_table).to_csv(os.path.join(OUT_ROOT, "fold_summary.csv"), index=False)
+append_log(master_log, f"Overall macro-F1={macro_f1_overall:.4f}, macro-AUPRC={ap_macro_overall:.4f}, weighted-AUPRC={ap_weighted_overall:.4f}")
