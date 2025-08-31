@@ -1,0 +1,12 @@
+HP trial: lr=2e-05, epochs=3, macro_F1=0.3238
+HP trial: lr=2e-05, epochs=5, macro_F1=0.3588
+HP trial: lr=5e-05, epochs=3, macro_F1=0.4831
+HP trial: lr=5e-05, epochs=5, macro_F1=0.2751
+Chosen HPs: lr=5e-05 epochs=3
+Fold metrics: acc=0.7731, f1_macro=0.4831, auprc_macro=0.5199, auprc_weighted=0.8106
+HP trial: lr=2e-05, epochs=3, macro_F1=0.3238
+HP trial: lr=2e-05, epochs=5, macro_F1=0.3588
+HP trial: lr=5e-05, epochs=3, macro_F1=0.4831
+HP trial: lr=5e-05, epochs=5, macro_F1=0.2751
+Chosen HPs: lr=5e-05 epochs=3
+Fold metrics: acc=0.7731, f1_macro=0.4831, auprc_macro=0.5199, auprc_weighted=0.8106
