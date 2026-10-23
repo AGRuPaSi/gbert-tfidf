@@ -1,6 +1,6 @@
 # CIRS Risk Categorization with GBERT
 
-Transformer-based explainable classification of Critical Incident Reports (CIRS) using German BERT (GBERT) and SHAP interpretability.
+Transformer-based explainable classification of Critical Incident Reports (CIRS) using German BERT (GBERT) and SHAP for interpretability.
 
 ---
 
